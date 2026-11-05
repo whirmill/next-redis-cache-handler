@@ -1,0 +1,49 @@
+{
+  "name": "@whirmill/next-redis-cache-handler",
+  "version": "1.2.0",
+  "description": "Redis cache handler for Next.js 14: no Redis during next build, build-scoped pages, a data cache that survives deploys, and startup registration of prerendered output.",
+  "keywords": [
+    "next",
+    "nextjs",
+    "cache-handler",
+    "redis",
+    "isr",
+    "incremental-cache"
+  ],
+  "license": "MIT",
+  "author": "Lorenzo De Santis",
+  "homepage": "https://github.com/whirmill/next-redis-cache-handler#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whirmill/next-redis-cache-handler.git"
+  },
+  "bugs": {
+    "url": "https://github.com/whirmill/next-redis-cache-handler/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/cache-handler.mjs",
+    "./package.json": "./package.json"
+  },
+  "main": "./src/cache-handler.mjs",
+  "files": [
+    "src/cache-handler.mjs",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "next": "^14.2.0",
+    "redis": "^4.6.0"
+  },
+  "devDependencies": {
+    "redis": "4.7.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
