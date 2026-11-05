@@ -65,16 +65,19 @@ Place it next to `app/` (in `src/` if the app uses one):
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
-  const { createRequire } = await import("node:module");
+  // node:module exports a function: in the webpack bundle its named exports
+  // are only reachable through `default`.
+  const nodeModule = await import("node:module");
+  const createRequire = nodeModule.createRequire ?? nodeModule.default.createRequire;
   const { realpathSync } = await import("node:fs");
   const path = await import("node:path");
   const { pathToFileURL } = await import("node:url");
 
   // Load the handler natively, by the same file URL Next.js uses for
   // `cacheHandler`, so both share one module instance and one Redis connection.
-  const require = createRequire(path.join(process.cwd(), "package.json"));
+  const resolveFromApp = createRequire(path.join(process.cwd(), "package.json"));
   const handlerUrl = pathToFileURL(
-    realpathSync(require.resolve("@whirmill/next-redis-cache-handler"))
+    realpathSync(resolveFromApp.resolve("@whirmill/next-redis-cache-handler"))
   ).href;
   const { default: CacheHandler, registerInitialCache } = await import(
     /* webpackIgnore: true */ handlerUrl
