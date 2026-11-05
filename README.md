@@ -150,6 +150,11 @@ npm install
 npm test
 ```
 
+## Releasing
+
+1. Bump `version` in `package.json` and commit on `main`.
+2. Tag the commit `v<version>` and push the tag: the `Release` workflow tests and publishes it to npm with provenance, through npm trusted publishing.
+
 ## License
 
 [MIT](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
