@@ -1,6 +1,6 @@
 # @whirmill/next-redis-cache-handler
 
-Redis cache handler for Next.js 14.
+Redis cache handler for Next.js 14, 15 and 16.
 
 - **No Redis during `next build`.** Builds do not need network access to Redis.
 - **Pages are scoped to their build.** HTML and RSC payloads reference the build's own assets, so a new build never serves the previous one's pages, nor the other way round.
@@ -12,7 +12,7 @@ Redis cache handler for Next.js 14.
 
 ## Requirements
 
-- Next.js 14.2 (App Router; Pages Router routes with `fallback: false` are supported)
+- Next.js 14.2, 15 or 16 (App Router; Pages Router routes with `fallback: false` are supported)
 - [`redis`](https://www.npmjs.com/package/redis) (node-redis) 4.x
 - Node.js 20 or later
 
@@ -29,7 +29,7 @@ npm install @whirmill/next-redis-cache-handler redis@4
 ```js
 module.exports = {
   experimental: {
-    // Required in Next.js 14 for instrumentation.ts
+    // Next.js 14 only: instrumentation.ts is enabled by default from Next.js 15.
     instrumentationHook: true,
   },
   cacheHandler:
@@ -48,7 +48,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
 export default {
-  experimental: { instrumentationHook: true },
+  experimental: { instrumentationHook: true }, // Next.js 14 only
   cacheHandler:
     process.env.NODE_ENV === "production"
       ? require.resolve("@whirmill/next-redis-cache-handler")
@@ -87,6 +87,8 @@ export async function register() {
 }
 ```
 
+If the Next.js 14 build fails with `UnhandledSchemeError: Reading from "node:url"`, add `/* webpackIgnore: true */` to the `node:` imports as well.
+
 A plain `import("@whirmill/next-redis-cache-handler")` would be bundled by webpack into a second copy of the module, with its own Redis connection and state. The handler warns at startup (`N copies of this module are configured`) if that happens.
 
 ### 3. Point it at Redis
@@ -102,7 +104,7 @@ Set `REDIS_PRIVATE_URL` or `REDIS_URL`. Without either, the handler uses an in-m
 | Tag indexes | `<prefix>__sharedTags__`, `<prefix>__revalidated_tags__` | refreshed on writes, at most `NEXT_CACHE_MAX_TTL_SECONDS` |
 
 - **Build** (`NEXT_PHASE=phase-production-build`): memory only.
-- **Startup**: `registerInitialCache` writes the prerender manifest's pages and routes with `SET NX`, so a restart or a second replica never overwrites newer entries. With a custom cache handler Next.js does not write `.next/cache/fetch-cache`, so the data cache fills on the first requests.
+- **Startup**: `registerInitialCache` writes the prerender manifest's pages and routes with `SET NX`, so a restart or a second replica never overwrites newer entries. It stores them in the shape the installed Next.js major reads, under the route-scoped key (`/route-cache/<kind>/<hash>/$<path>`) that Next.js 15.5.27+ and 16.4+ record in each entry's `.meta` file, or under the page path in earlier versions. Partial prerendering and fallback shells are left to Next.js. With a custom cache handler Next.js does not write `.next/cache/fetch-cache`, so the data cache fills on the first requests.
 - **Revalidation**: `revalidateTag` deletes the tagged entries in both keyspaces and records a timestamp for the tag. Entries written before that timestamp, such as build output restored after a restart, are treated as missing. Implicit tags (`revalidatePath`) are checked the same way.
 - **Redis outage**: while the client is disconnected, reads and writes use an in-process memory cache, never both at once, so another replica's revalidation cannot leave a stale copy behind. The client reconnects with backoff.
 
@@ -144,7 +146,10 @@ Settings read from the environment are evaluated when the package is first impor
 ## Notes
 
 - Do not pass `disableOfflineQueue` to a node-redis 4 client used with per-command abort signals: when the connection drops it throws in `flushAll` and never reconnects. The handler creates its own client and keeps the offline queue.
-- The handler targets the Next.js 14 cache handler interface (prerender manifest version 4). Next.js 15 and later are not supported.
+- The handler implements the `cacheHandler` interface (prerender manifest version 4) of Next.js 14, 15 and 16. It does not implement `cacheHandlers` (plural), used by the `"use cache"` directive.
+- Next.js 15 no longer caches `fetch` by default: only requests that opt in, for example with `cache: "force-cache"` or `next: { revalidate }`, reach the handler.
+- `revalidateTag(tag, profile)` in Next.js 16 drops the tagged entries at once: the stale-while-revalidate profile is not applied, so the next request renders them again.
+- Images optimized by `next/image` never reach the handler: Next.js keeps them in `.next/cache/images`.
 
 ## Development
 
