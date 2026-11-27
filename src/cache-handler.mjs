@@ -1,5 +1,5 @@
 /**
- * @whirmill/next-redis-cache-handler 1.2.0
+ * @whirmill/next-redis-cache-handler 1.3.0
  * Redis cache handler for Next.js 14, 15 and 16 (App Router, with Pages Router support).
  *
  * Behaviour
