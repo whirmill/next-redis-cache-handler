@@ -1,6 +1,6 @@
 /**
- * @whirmill/next-redis-cache-handler 1.2.0
- * Redis cache handler for Next.js 14 (App Router, with Pages Router support).
+ * @whirmill/next-redis-cache-handler 1.3.0
+ * Redis cache handler for Next.js 14, 15 and 16 (App Router, with Pages Router support).
  *
  * Behaviour
  * - Build (`next build`): never connects to Redis. Prerendered output is
@@ -31,6 +31,7 @@
  * Usage: see README.md.
  */
 import { promises as fsPromises } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { commandOptions, createClient } from "redis";
 
@@ -39,6 +40,10 @@ const CACHE_ONE_YEAR = 31536000;
 const DEFAULT_STALE_AGE_SECONDS = CACHE_ONE_YEAR;
 const MAX_INT32 = 2 ** 31 - 1;
 const NEXT_CACHE_IMPLICIT_TAG_ID = "_N_T_";
+// Next.js 15.5.27+ and 16.4+ scope response cache keys by their source route:
+// `/route-cache/<kind>/<sha256 of the route>/$<page path>`.
+const ROUTE_CACHE_KEY_PREFIX = "/route-cache/";
+const ROUTE_CACHE_PATH_MARKER = "/$/";
 const SHARED_TAGS_KEY = "__sharedTags__";
 const REVALIDATED_TAGS_KEY = "__revalidated_tags__";
 const INDEX_TTL_REFRESH_MS = 60_000;
@@ -109,6 +114,105 @@ function getTagsFromHeaders(headers) {
   return [];
 }
 
+/**
+ * Page path of a response cache key: the key itself before Next.js 15.5.27,
+ * the part after `/$` for route-scoped keys.
+ */
+function pagePathOfKey(key) {
+  if (!key.startsWith(ROUTE_CACHE_KEY_PREFIX)) return key;
+  const marker = key.indexOf(ROUTE_CACHE_PATH_MARKER);
+  return marker === -1 ? key : key.slice(marker + 2);
+}
+
+/** Next.js 14 marks data cache reads with `kindHint: "fetch"`, Next.js 15 with `kind: "FETCH"`. */
+function isFetchRead(meta) {
+  return meta?.kind === "FETCH" || meta?.kindHint === "fetch";
+}
+
+const RESPONSE_KINDS = new Set(["PAGE", "ROUTE", "PAGES", "APP_PAGE", "APP_ROUTE"]);
+
+/**
+ * `revalidate` of an entry in seconds, or false when it never goes stale.
+ * Next.js 14 passes it in `ctx.revalidate`; Next.js 15 passes `ctx.cacheControl`
+ * for pages and route handlers and keeps it on the value for fetch entries.
+ */
+function revalidateOf(ctx, value) {
+  const revalidate =
+    ctx.revalidate ?? ctx.cacheControl?.revalidate ?? (value?.kind === "FETCH" ? value.revalidate : undefined);
+  return revalidate === CACHE_ONE_YEAR ? false : revalidate;
+}
+
+/**
+ * Makes a cache value JSON-safe: route bodies, RSC payloads and segment
+ * prefetches are Buffers (a Map of Buffers for segments) in Next.js 15.
+ */
+function serializeValue(value) {
+  switch (value?.kind) {
+    case "ROUTE":
+    case "APP_ROUTE":
+      return { ...value, body: Buffer.from(value.body).toString("base64") };
+    case "APP_PAGE":
+      return {
+        ...value,
+        rscData: value.rscData === undefined ? undefined : Buffer.from(value.rscData).toString("base64"),
+        segmentData:
+          value.segmentData === undefined
+            ? undefined
+            : Object.fromEntries(
+                Array.from(value.segmentData, ([segment, data]) => [segment, Buffer.from(data).toString("base64")])
+              ),
+      };
+    default:
+      return value;
+  }
+}
+
+function deserializeValue(value) {
+  switch (value?.kind) {
+    case "ROUTE":
+    case "APP_ROUTE":
+      return { ...value, body: Buffer.from(value.body, "base64") };
+    case "APP_PAGE":
+      return {
+        ...value,
+        rscData: typeof value.rscData === "string" ? Buffer.from(value.rscData, "base64") : undefined,
+        segmentData: value.segmentData
+          ? new Map(Object.entries(value.segmentData).map(([segment, data]) => [segment, Buffer.from(data, "base64")]))
+          : undefined,
+      };
+    default:
+      return value;
+  }
+}
+
+/** Major version of the `next` package the app resolves, or undefined. */
+function resolvedNextMajor() {
+  try {
+    const require = createRequire(path.join(process.cwd(), "package.json"));
+    return Number.parseInt(require("next/package.json").version, 10) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Next.js major that produced the build in `nextDir`, read from
+ * `required-server-files.json`: from 15.0, `next build` always writes
+ * `cacheHandlers` there (`config.experimental.cacheHandlers` in 15,
+ * `config.cacheHandlers` from 16), even when empty; Next.js 14 never does.
+ * Returns 14, 15 (meaning 15 or later) or undefined when the file is unreadable.
+ */
+async function builtNextMajor(nextDir) {
+  try {
+    const { config } = JSON.parse(await fsPromises.readFile(path.join(nextDir, "required-server-files.json"), "utf-8"));
+    if (!config || typeof config !== "object") return undefined;
+    const hasCacheHandlers = Object.hasOwn(config, "cacheHandlers") || Object.hasOwn(config.experimental ?? {}, "cacheHandlers");
+    return hasCacheHandlers ? 15 : 14;
+  } catch {
+    return undefined;
+  }
+}
+
 function getLifespanParameters(lastModified, revalidate, defaultTtlSeconds = DEFAULT_TTL_SECONDS) {
   const lastModifiedAt = Math.floor(lastModified / 1000);
   // Entries without `revalidate` expire after the configured default lifetime, if any.
@@ -137,7 +241,7 @@ function timeout(timeoutMs) {
   return commandOptions({ signal: AbortSignal.timeout(timeoutMs) });
 }
 
-export { getLifespanParameters };
+export { deserializeValue, getLifespanParameters, serializeValue };
 
 export function createMemoryHandler({ maxEntries = MEMORY_MAX_ENTRIES } = {}) {
   const store = new Map();
@@ -345,11 +449,11 @@ export function createRedisStringsHandler({
 /**
  * Sends data (fetch cache) entries to `dataHandler` and pages and route
  * handlers to `pagesHandler`. Next.js marks fetch-cache reads with
- * `kindHint: "fetch"` and stores them with `kind: "FETCH"`; tag revalidation
- * and deletes apply to both keyspaces.
+ * `kind: "FETCH"` (`kindHint: "fetch"` in Next.js 14) and stores them with
+ * `kind: "FETCH"`; tag revalidation and deletes apply to both keyspaces.
  */
 export function createKindRouter({ pagesHandler, dataHandler }) {
-  const forRead = (meta) => (meta?.kindHint === "fetch" ? dataHandler : pagesHandler);
+  const forRead = (meta) => (isFetchRead(meta) ? dataHandler : pagesHandler);
   const forValue = (cacheValue) => (cacheValue?.value?.kind === "FETCH" ? dataHandler : pagesHandler);
 
   return {
@@ -465,12 +569,12 @@ class CacheHandler {
     CacheHandler.#onCreationHook = onCreationHook;
   }
 
-  static async #readPagesRouterPage(cacheKey) {
+  static async #readPagesRouterPage(pagePath, kind) {
     let pageHtmlHandle = null;
 
     try {
-      const pageHtmlPath = path.join(CacheHandler.#serverDistDir, "pages", `${cacheKey}.html`);
-      const pageDataPath = path.join(CacheHandler.#serverDistDir, "pages", `${cacheKey}.json`);
+      const pageHtmlPath = path.join(CacheHandler.#serverDistDir, "pages", `${pagePath}.html`);
+      const pageDataPath = path.join(CacheHandler.#serverDistDir, "pages", `${pagePath}.json`);
 
       pageHtmlHandle = await fsPromises.open(pageHtmlPath, "r");
 
@@ -485,7 +589,7 @@ class CacheHandler {
         lifespan: null,
         tags: [],
         value: {
-          kind: "PAGE",
+          kind,
           html: pageHtmlFile,
           pageData,
           postponed: undefined,
@@ -500,10 +604,10 @@ class CacheHandler {
     }
   }
 
-  static async #writePagesRouterPage(cacheKey, pageData) {
+  static async #writePagesRouterPage(pagePath, pageData) {
     try {
-      const pageHtmlPath = path.join(CacheHandler.#serverDistDir, "pages", `${cacheKey}.html`);
-      const pageDataPath = path.join(CacheHandler.#serverDistDir, "pages", `${cacheKey}.json`);
+      const pageHtmlPath = path.join(CacheHandler.#serverDistDir, "pages", `${pagePath}.html`);
+      const pageDataPath = path.join(CacheHandler.#serverDistDir, "pages", `${pagePath}.json`);
 
       await fsPromises.mkdir(path.dirname(pageHtmlPath), { recursive: true });
       await Promise.all([
@@ -607,25 +711,32 @@ class CacheHandler {
     CacheHandler.#context ??= context;
   }
 
+  /**
+   * `ctx` is what Next.js passes: `kind` ("FETCH", "APP_PAGE", "APP_ROUTE",
+   * "PAGES") and, for fetch reads, `tags` and `softTags` in Next.js 15;
+   * `kindHint` and `softTags` in Next.js 14.
+   */
   async get(cacheKey, ctx = {}) {
     await CacheHandler.#configureCacheHandler();
 
-    const { softTags = [], kindHint } = ctx;
+    const { softTags = [], kindHint, kind } = ctx;
+    // Tags passed at read time, not only those stored with the entry, can invalidate it.
+    const implicitTags = isFetchRead(ctx) ? [...(ctx.tags ?? []), ...softTags] : softTags;
 
-    let cachedData = await CacheHandler.#mergedHandler.get(cacheKey, { implicitTags: softTags, kindHint });
+    let cachedData = await CacheHandler.#mergedHandler.get(cacheKey, { implicitTags, kindHint, kind });
 
-    if (cachedData?.value?.kind === "ROUTE") {
-      cachedData.value.body = Buffer.from(cachedData.value.body, "base64");
-    }
-
-    if (!cachedData && CacheHandler.#fallbackFalseRoutes.has(cacheKey)) {
-      cachedData = await CacheHandler.#readPagesRouterPage(cacheKey);
+    const pagePath = pagePathOfKey(cacheKey);
+    if (!cachedData && !isFetchRead(ctx) && CacheHandler.#fallbackFalseRoutes.has(pagePath)) {
+      const pageKind = kind === "PAGES" ? "PAGES" : "PAGE";
+      cachedData = await CacheHandler.#readPagesRouterPage(pagePath, pageKind);
       if (cachedData) {
         await CacheHandler.#mergedHandler.set(cacheKey, cachedData);
       }
     }
 
-    return cachedData ?? null;
+    if (!cachedData) return null;
+
+    return { ...cachedData, value: deserializeValue(cachedData.value) };
   }
 
   /**
@@ -637,57 +748,51 @@ class CacheHandler {
   async set(cacheKey, incrementalCacheValue, ctx = {}) {
     await CacheHandler.#configureCacheHandler();
 
-    const { revalidate, tags = [], initialLastModified, onlyIfAbsent = false } = ctx;
+    const { tags = [], cacheControl, initialLastModified, onlyIfAbsent = false } = ctx;
+    const value = incrementalCacheValue;
     const lastModified = Math.round(initialLastModified ?? Date.now());
 
-    const hasFallbackFalse = CacheHandler.#fallbackFalseRoutes.has(cacheKey);
-    const lifespan = hasFallbackFalse ? null : getLifespanParameters(lastModified, revalidate);
+    const pagePath = pagePathOfKey(cacheKey);
+    const isPagesRouterPage = value?.kind === "PAGE" || value?.kind === "PAGES";
+    const hasFallbackFalse = isPagesRouterPage && CacheHandler.#fallbackFalseRoutes.has(pagePath);
+    const lifespan = hasFallbackFalse ? null : getLifespanParameters(lastModified, revalidateOf(ctx, value));
 
     if (lifespan !== null && Date.now() > lifespan.expireAt * 1000) {
       return false;
     }
 
-    let cacheTags = tags;
-    let value = incrementalCacheValue;
-
-    switch (value?.kind) {
-      case "PAGE": {
-        cacheTags = getTagsFromHeaders(value.headers ?? {});
-        break;
-      }
-      case "ROUTE": {
-        value = {
-          body: value.body.toString("base64"),
-          headers: value.headers,
-          kind: value.kind,
-          status: value.status,
-        };
-        break;
-      }
-      default:
-        break;
-    }
+    // Pages and route handlers carry their tags, implicit ones included, in a header.
+    const cacheTags = RESPONSE_KINDS.has(value?.kind)
+      ? Array.from(new Set([...tags, ...getTagsFromHeaders(value.headers ?? {})]))
+      : tags;
 
     const cacheValue = {
       lastModified,
       lifespan,
       tags: Object.freeze(cacheTags),
-      value,
+      value: serializeValue(value),
+      // Returned by get: Next.js 16 serves the entry with the lifetime it was stored with.
+      ...(cacheControl ? { cacheControl } : {}),
     };
 
     const stored = await CacheHandler.#mergedHandler.set(cacheKey, cacheValue, { onlyIfAbsent });
 
-    if (hasFallbackFalse && cacheValue.value?.kind === "PAGE") {
-      await CacheHandler.#writePagesRouterPage(cacheKey, cacheValue.value);
+    if (hasFallbackFalse) {
+      await CacheHandler.#writePagesRouterPage(pagePath, value);
     }
 
     return stored;
   }
 
-  async revalidateTag(tag) {
+  /**
+   * Accepts one tag or a list. The second argument of Next.js 16
+   * (`{ expire }`, stale-while-revalidate) is ignored: tagged entries are
+   * always dropped at once, so the next request renders them again.
+   */
+  async revalidateTag(tags, _durations) {
     await CacheHandler.#configureCacheHandler();
 
-    for (const currentTag of typeof tag === "string" ? [tag] : tag) {
+    for (const currentTag of typeof tags === "string" ? [tags] : tags ?? []) {
       await CacheHandler.#mergedHandler.revalidateTag(currentTag);
     }
   }
@@ -745,8 +850,19 @@ async function runWithConcurrency(items, limit, worker) {
  * Copies the build output (prerendered pages, route handlers and fetch cache)
  * into the cache handler at server startup. Entries that already exist for
  * this build are left as they are. Call it from `instrumentation.ts`.
+ *
+ * Entries are stored in the shape the installed Next.js major reads (`PAGE`
+ * and `ROUTE` in 14, `APP_PAGE`, `PAGES` and `APP_ROUTE` from 15), under the
+ * route-scoped key Next.js 15.5.27+ records in each entry's `.meta` file when
+ * there is one. From Next.js 15, partial prerendering shells and fallback
+ * shells are left to Next.js.
+ *
+ * The major comes from `options.nextMajorVersion`, else from the `next`
+ * package the app resolves, else from the build output. When none of them
+ * tells it, only fetch entries (the same shape in every version) are stored:
+ * a page in the wrong shape would be served broken, a missing one is rendered.
  */
-export async function registerInitialCache(Handler = CacheHandler, { distDir = ".next" } = {}) {
+export async function registerInitialCache(Handler = CacheHandler, { distDir = ".next", nextMajorVersion: major } = {}) {
   if (process.env.NODE_ENV !== "production" || isBuildPhase()) return;
 
   const nextDir = path.join(process.cwd(), distDir);
@@ -765,8 +881,18 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
     return;
   }
 
+  const nextMajor = Number.parseInt(major, 10) || resolvedNextMajor() || (await builtNextMajor(nextDir));
+  const legacyKinds = nextMajor < 15;
+  if (nextMajor === undefined) {
+    console.warn(
+      "[cache-handler] initial cache: cannot tell the Next.js version (next/package.json and " +
+        `${path.join(distDir, "required-server-files.json")} are unreadable), so pages and route handlers are left to ` +
+        "Next.js. Pass { nextMajorVersion } to registerInitialCache to store them."
+    );
+  }
+
   const cacheHandler = new Handler({ serverDistDir, dev: false });
-  const counts = { pages: 0, routes: 0, fetch: 0, skipped: 0, failed: 0 };
+  const counts = { pages: 0, routes: 0, fetch: 0, skipped: 0, ignored: 0, failed: 0 };
 
   async function setEntry(kind, key, value, ctx) {
     try {
@@ -778,41 +904,91 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
     }
   }
 
-  async function setPage(route, router, revalidate) {
+  const readMeta = (file) => fsPromises.readFile(file, "utf-8").then((data) => JSON.parse(data));
+
+  function lifetime(route) {
+    return {
+      revalidate: route.initialRevalidateSeconds,
+      cacheControl: legacyKinds
+        ? undefined
+        : { revalidate: route.initialRevalidateSeconds, expire: route.initialExpireSeconds },
+    };
+  }
+
+  async function readSegments(base, segmentPaths) {
+    if (!Array.isArray(segmentPaths)) return undefined;
+    const segmentData = new Map();
+    await Promise.all(
+      segmentPaths.map(async (segmentPath) => {
+        try {
+          segmentData.set(segmentPath, await fsPromises.readFile(`${base}.segments${segmentPath}.segment.rsc`));
+        } catch {
+          // Next.js treats a missing segment as dynamic too.
+        }
+      })
+    );
+    return segmentData;
+  }
+
+  async function setPage(route, router, manifestRoute) {
     const cachePath = normalizePagePath(route);
     const base = path.join(serverDistDir, router, cachePath);
     const isAppRouter = router === "app";
 
     try {
-      const [{ mtimeMs }, html, pageData, meta] = await Promise.all([
+      const [{ mtimeMs }, html, data, meta] = await Promise.all([
         fsPromises.stat(`${base}.html`),
         fsPromises.readFile(`${base}.html`, "utf-8"),
-        fsPromises
-          .readFile(`${base}.${isAppRouter ? "rsc" : "json"}`, "utf-8")
-          .then((data) => (isAppRouter ? data : JSON.parse(data))),
-        isAppRouter ? fsPromises.readFile(`${base}.meta`, "utf-8").then((data) => JSON.parse(data)) : undefined,
+        isAppRouter && !legacyKinds
+          ? fsPromises.readFile(`${base}.rsc`)
+          : fsPromises
+              .readFile(`${base}.${isAppRouter ? "rsc" : "json"}`, "utf-8")
+              .then((text) => (isAppRouter ? text : JSON.parse(text))),
+        // Pages Router entries have a .meta file only from Next.js 15.5.27.
+        isAppRouter ? readMeta(`${base}.meta`) : readMeta(`${base}.meta`).catch(() => undefined),
       ]);
 
-      await setEntry(
-        "pages",
-        cachePath,
-        {
+      // Next.js 15 reads these through its own resume logic: let it render them.
+      if (!legacyKinds && (meta?.routeCache?.isFallback || meta?.postponed !== undefined || manifestRoute.experimentalPPR)) {
+        counts.ignored += 1;
+        return;
+      }
+
+      let value;
+      if (legacyKinds) {
+        value = {
           kind: "PAGE",
           html,
-          pageData,
+          pageData: data,
           postponed: meta?.postponed,
           headers: meta?.headers,
           status: meta?.status,
-        },
-        { revalidate, initialLastModified: mtimeMs }
-      );
+        };
+      } else if (isAppRouter) {
+        value = {
+          kind: "APP_PAGE",
+          html,
+          rscData: data,
+          headers: meta?.headers,
+          postponed: undefined,
+          status: meta?.status,
+          segmentData: await readSegments(base, meta?.segmentPaths),
+        };
+      } else {
+        value = { kind: "PAGES", html, pageData: data, headers: meta?.headers, status: meta?.status };
+      }
+
+      await setEntry("pages", meta?.routeCache?.key ?? cachePath, value, {
+        ...lifetime(manifestRoute),
+        initialLastModified: meta?.routeCacheLastModified ?? mtimeMs,
+      });
     } catch (error) {
       counts.failed += 1;
       debugWarn(`initial cache: cannot read page ${cachePath}`, error?.message || error);
     }
   }
 
-  async function setRoute(route, revalidate) {
+  async function setRoute(route, manifestRoute) {
     const cachePath = normalizePagePath(route);
     const base = path.join(serverDistDir, "app", cachePath);
 
@@ -820,7 +996,7 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
       const [{ mtimeMs }, body, meta] = await Promise.all([
         fsPromises.stat(`${base}.body`),
         fsPromises.readFile(`${base}.body`),
-        fsPromises.readFile(`${base}.meta`, "utf-8").then((data) => JSON.parse(data)),
+        readMeta(`${base}.meta`),
       ]);
 
       if (!(meta.headers && meta.status)) {
@@ -829,9 +1005,13 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
 
       await setEntry(
         "routes",
-        cachePath,
-        { kind: "ROUTE", body, headers: meta.headers, status: meta.status },
-        { revalidate, initialLastModified: mtimeMs, tags: getTagsFromHeaders(meta.headers) }
+        meta.routeCache?.key ?? cachePath,
+        { kind: legacyKinds ? "ROUTE" : "APP_ROUTE", body, headers: meta.headers, status: meta.status },
+        {
+          ...lifetime(manifestRoute),
+          initialLastModified: meta.routeCacheLastModified ?? mtimeMs,
+          tags: getTagsFromHeaders(meta.headers),
+        }
       );
     } catch (error) {
       counts.failed += 1;
@@ -860,13 +1040,16 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
   }
 
   const routes = Object.entries(prerenderManifest.routes);
-  await runWithConcurrency(routes, INITIAL_CACHE_CONCURRENCY, async ([cachePath, { dataRoute, initialRevalidateSeconds }]) => {
-    if (dataRoute?.endsWith(".json")) {
-      await setPage(cachePath, "pages", initialRevalidateSeconds);
+  await runWithConcurrency(routes, INITIAL_CACHE_CONCURRENCY, async ([cachePath, manifestRoute]) => {
+    const { dataRoute } = manifestRoute;
+    if (nextMajor === undefined) {
+      if (dataRoute === null || dataRoute?.endsWith(".json") || dataRoute?.endsWith(".rsc")) counts.ignored += 1;
+    } else if (dataRoute?.endsWith(".json")) {
+      await setPage(cachePath, "pages", manifestRoute);
     } else if (dataRoute?.endsWith(".rsc")) {
-      await setPage(cachePath, "app", initialRevalidateSeconds);
+      await setPage(cachePath, "app", manifestRoute);
     } else if (dataRoute === null) {
-      await setRoute(cachePath, initialRevalidateSeconds);
+      await setRoute(cachePath, manifestRoute);
     }
   });
 
@@ -881,7 +1064,7 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
   log(
     `initial cache registered in ${Date.now() - startedAt} ms: ` +
       `${counts.pages} pages, ${counts.routes} routes, ${counts.fetch} fetch entries stored, ` +
-      `${counts.skipped} already present or expired, ${counts.failed} failed`
+      `${counts.skipped} already present or expired, ${counts.ignored} left to Next.js, ${counts.failed} failed`
   );
 }
 
