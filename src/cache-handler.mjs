@@ -186,10 +186,28 @@ function deserializeValue(value) {
 }
 
 /** Major version of the `next` package the app resolves, or undefined. */
-function nextMajorVersion() {
+function resolvedNextMajor() {
   try {
     const require = createRequire(path.join(process.cwd(), "package.json"));
     return Number.parseInt(require("next/package.json").version, 10) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Next.js major that produced the build in `nextDir`, read from
+ * `required-server-files.json`: from 15.0, `next build` always writes
+ * `cacheHandlers` there (`config.experimental.cacheHandlers` in 15,
+ * `config.cacheHandlers` from 16), even when empty; Next.js 14 never does.
+ * Returns 14, 15 (meaning 15 or later) or undefined when the file is unreadable.
+ */
+async function builtNextMajor(nextDir) {
+  try {
+    const { config } = JSON.parse(await fsPromises.readFile(path.join(nextDir, "required-server-files.json"), "utf-8"));
+    if (!config || typeof config !== "object") return undefined;
+    const hasCacheHandlers = Object.hasOwn(config, "cacheHandlers") || Object.hasOwn(config.experimental ?? {}, "cacheHandlers");
+    return hasCacheHandlers ? 15 : 14;
   } catch {
     return undefined;
   }
@@ -837,8 +855,12 @@ async function runWithConcurrency(items, limit, worker) {
  * and `ROUTE` in 14, `APP_PAGE`, `PAGES` and `APP_ROUTE` from 15), under the
  * route-scoped key Next.js 15.5.27+ records in each entry's `.meta` file when
  * there is one. From Next.js 15, partial prerendering shells and fallback
- * shells are left to Next.js. `options.nextMajorVersion` overrides the
- * detected major (default: the `next` package resolved from the app, else 15).
+ * shells are left to Next.js.
+ *
+ * The major comes from `options.nextMajorVersion`, else from the `next`
+ * package the app resolves, else from the build output. When none of them
+ * tells it, only fetch entries (the same shape in every version) are stored:
+ * a page in the wrong shape would be served broken, a missing one is rendered.
  */
 export async function registerInitialCache(Handler = CacheHandler, { distDir = ".next", nextMajorVersion: major } = {}) {
   if (process.env.NODE_ENV !== "production" || isBuildPhase()) return;
@@ -847,7 +869,6 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
   const serverDistDir = path.join(nextDir, "server");
   const fetchCacheDir = path.join(nextDir, "cache", "fetch-cache");
   const startedAt = Date.now();
-  const legacyKinds = (major ?? nextMajorVersion() ?? 15) < 15;
 
   let prerenderManifest;
   try {
@@ -858,6 +879,16 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
   } catch (error) {
     log(`initial cache skipped: ${error?.message || error}`);
     return;
+  }
+
+  const nextMajor = Number.parseInt(major, 10) || resolvedNextMajor() || (await builtNextMajor(nextDir));
+  const legacyKinds = nextMajor < 15;
+  if (nextMajor === undefined) {
+    console.warn(
+      "[cache-handler] initial cache: cannot tell the Next.js version (next/package.json and " +
+        `${path.join(distDir, "required-server-files.json")} are unreadable), so pages and route handlers are left to ` +
+        "Next.js. Pass { nextMajorVersion } to registerInitialCache to store them."
+    );
   }
 
   const cacheHandler = new Handler({ serverDistDir, dev: false });
@@ -1011,7 +1042,9 @@ export async function registerInitialCache(Handler = CacheHandler, { distDir = "
   const routes = Object.entries(prerenderManifest.routes);
   await runWithConcurrency(routes, INITIAL_CACHE_CONCURRENCY, async ([cachePath, manifestRoute]) => {
     const { dataRoute } = manifestRoute;
-    if (dataRoute?.endsWith(".json")) {
+    if (nextMajor === undefined) {
+      if (dataRoute === null || dataRoute?.endsWith(".json") || dataRoute?.endsWith(".rsc")) counts.ignored += 1;
+    } else if (dataRoute?.endsWith(".json")) {
       await setPage(cachePath, "pages", manifestRoute);
     } else if (dataRoute?.endsWith(".rsc")) {
       await setPage(cachePath, "app", manifestRoute);

@@ -553,3 +553,106 @@ test("registerInitialCache stores Next.js 15 output under route-scoped keys from
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+/** A minimal build output with one App Router page, one route handler and one fetch cache entry. */
+async function writeBuildOutput(dir, { requiredServerFiles } = {}) {
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const next = path.join(dir, ".next");
+  const app = path.join(next, "server", "app");
+  await mkdir(app, { recursive: true });
+  await mkdir(path.join(next, "cache", "fetch-cache"), { recursive: true });
+  await writeFile(
+    path.join(next, "prerender-manifest.json"),
+    JSON.stringify({
+      version: 4,
+      routes: {
+        "/about": { srcRoute: "/about", dataRoute: "/about.rsc", initialRevalidateSeconds: 60 },
+        "/robots.txt": { srcRoute: "/robots.txt", dataRoute: null, initialRevalidateSeconds: false },
+      },
+      dynamicRoutes: {},
+    })
+  );
+  await writeFile(path.join(app, "about.html"), "<html>about</html>");
+  await writeFile(path.join(app, "about.rsc"), "rsc:about");
+  await writeFile(path.join(app, "about.meta"), JSON.stringify({ headers: { "x-next-cache-tags": "all" }, status: 200 }));
+  await writeFile(path.join(app, "robots.txt.body"), "User-agent: *");
+  await writeFile(path.join(app, "robots.txt.meta"), JSON.stringify({ headers: { "content-type": "text/plain" }, status: 200 }));
+  await writeFile(
+    path.join(next, "cache", "fetch-cache", "abc123"),
+    JSON.stringify({ kind: "FETCH", data: { headers: {}, body: "e30=", status: 200, url: "https://example.com" }, revalidate: 60, tags: ["posts"] })
+  );
+  if (requiredServerFiles) {
+    await writeFile(path.join(next, "required-server-files.json"), JSON.stringify(requiredServerFiles));
+  }
+  return next;
+}
+
+function readKindsScript(next) {
+  return `
+    import CacheHandler, { registerInitialCache } from ${HANDLER_PATH};
+    await registerInitialCache(CacheHandler);
+    const handler = new CacheHandler({ serverDistDir: ${JSON.stringify(path.join(next, "server"))}, dev: false });
+    console.log(JSON.stringify({
+      page: (await handler.get("/about", {}))?.value.kind ?? null,
+      route: (await handler.get("/robots.txt", {}))?.value.kind ?? null,
+      fetch: (await handler.get("abc123", { kindHint: "fetch", tags: ["posts"] }))?.value.kind ?? null,
+    }));
+  `;
+}
+
+for (const [label, requiredServerFiles, expected] of [
+  ["Next.js 14", { version: 1, config: { experimental: {} } }, { page: "PAGE", route: "ROUTE" }],
+  ["Next.js 15", { version: 1, config: { expireTime: 31536000, experimental: { cacheHandlers: {} } } }, { page: "APP_PAGE", route: "APP_ROUTE" }],
+  ["Next.js 16", { version: 1, config: { expireTime: 31536000, cacheHandlers: {}, experimental: {} } }, { page: "APP_PAGE", route: "APP_ROUTE" }],
+]) {
+  test(`registerInitialCache reads the ${label} major from required-server-files.json when next is not resolvable`, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "cache-handler-"));
+    try {
+      const next = await writeBuildOutput(dir, { requiredServerFiles });
+      const result = runScript(readKindsScript(next), { cwd: dir });
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /1 pages, 1 routes, 1 fetch entries stored, 0 already present or expired, 0 left to Next.js, 0 failed/);
+      assert.deepEqual(JSON.parse(result.stdout.trim().split("\n").at(-1)), { ...expected, fetch: "FETCH" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("the next package wins over the build output, and an explicit nextMajorVersion wins over both", async () => {
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const dir = await mkdtemp(path.join(tmpdir(), "cache-handler-"));
+  try {
+    const next = await writeBuildOutput(dir, { requiredServerFiles: { version: 1, config: { experimental: { cacheHandlers: {} } } } });
+    await mkdir(path.join(dir, "node_modules", "next"), { recursive: true });
+    await writeFile(path.join(dir, "node_modules", "next", "package.json"), JSON.stringify({ name: "next", version: "14.2.35" }));
+
+    const fromPackage = runScript(readKindsScript(next), { cwd: dir });
+    assert.equal(fromPackage.status, 0, fromPackage.stderr);
+    assert.equal(JSON.parse(fromPackage.stdout.trim().split("\n").at(-1)).page, "PAGE");
+
+    await rm(path.join(dir, "node_modules"), { recursive: true });
+    await rm(path.join(next, "required-server-files.json"));
+    const explicit = runScript(readKindsScript(next).replace("registerInitialCache(CacheHandler)", "registerInitialCache(CacheHandler, { nextMajorVersion: 14 })"), { cwd: dir });
+    assert.equal(explicit.status, 0, explicit.stderr);
+    assert.equal(JSON.parse(explicit.stdout.trim().split("\n").at(-1)).page, "PAGE");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("registerInitialCache stores only fetch entries when it cannot tell the Next.js version", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "cache-handler-"));
+  try {
+    const next = await writeBuildOutput(dir);
+    const result = runScript(readKindsScript(next), { cwd: dir });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /cannot tell the Next\.js version/);
+    assert.match(result.stdout, /0 pages, 0 routes, 1 fetch entries stored, 0 already present or expired, 2 left to Next\.js, 0 failed/);
+    assert.deepEqual(JSON.parse(result.stdout.trim().split("\n").at(-1)), { page: null, route: null, fetch: "FETCH" });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
